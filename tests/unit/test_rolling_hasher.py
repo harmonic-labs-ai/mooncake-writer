@@ -183,14 +183,23 @@ class TestTextsToHashes:
         assert result[0] == []
 
     def test_texts_to_hashes_shared_prefix(self, mock_tokenizer) -> None:
-        """Test that shared text prefixes produce shared hash IDs."""
-        # Two texts with identical first 10 chars (1 block)
-        texts = ["aaaaaaaaaa" + "b" * 10, "aaaaaaaaaa" + "c" * 10]
+        """Test that shared token prefixes produce shared hash IDs.
+
+        The mock tokenizer produces [0..N-1] for a text of length N, so
+        "a"*20 -> [0..19] (2 blocks of 10) and "a"*25 -> [0..24] (2 full + 1 partial).
+        The first block [0..9] is identical; the second block differs
+        ([10..19] vs [10..19,20..24] -- wait, both have [10..19] as the full
+        second block).  Use "a"*20 (2 blocks) vs "a"*15 (1 full + 1 partial)
+        so the second block differs: [10..19] vs [10..14].
+        """
+        texts = ["a" * 20, "a" * 15]
         result = texts_to_hashes(mock_tokenizer, texts, block_size=10)
 
         assert len(result) == 2
-        # First block should have same hash ID (shared prefix)
-        assert result[0][0] == result[1][0]
+        assert len(result[0]) == 2  # 20 / 10 = 2 blocks
+        assert len(result[1]) == 2  # 15 / 10 = 1 full + 1 partial
+        assert result[0][0] == result[1][0], "First block shares tokens [0..9]"
+        assert result[0][1] != result[1][1], "Second block differs: [10..19] vs [10..14]"
 
 
 class TestHashesToTexts:
