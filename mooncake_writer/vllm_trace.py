@@ -1,9 +1,4 @@
-"""ASGI middleware for capturing vLLM chat traffic as Mooncake traces.
-
-This middleware wraps the existing ``MooncakeWriter`` implementation so that a
-vLLM OpenAI-compatible server can append replayable chat traces without
-rewriting the hashing logic already present in this repo.
-"""
+"""ASGI middleware for capturing vLLM chat traffic as Mooncake traces."""
 
 from __future__ import annotations
 
@@ -28,8 +23,6 @@ ASGIApp = Callable[[dict[str, Any], ASGIReceive, ASGISend], Any]
 DEFAULT_TRACE_PATH = "vllm_mooncake_traces.jsonl"
 DEFAULT_BLOCK_SIZE = 512
 DEFAULT_MAX_BODY_BYTES = 1024 * 1024
-TRACE_MODE_RAW = "raw"
-TRACE_MODE_HASH_ONLY = "hash_only"
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -56,40 +49,21 @@ class TraceConfig:
 
     enabled: bool = False
     path: Path = Path(DEFAULT_TRACE_PATH)
-    mode: str = TRACE_MODE_HASH_ONLY
-    session_header: str = "x-session-id"
-    session_body_path: str | None = None
     block_size: int = DEFAULT_BLOCK_SIZE
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
-    include_response_text: bool = False
     tokenizer_name: str | None = None
 
     @classmethod
     def from_env(cls) -> "TraceConfig":
         """Load trace capture settings from environment variables."""
-        mode = os.getenv("VLLM_MOONCAKE_TRACE_MODE", TRACE_MODE_HASH_ONLY).strip()
-        if mode not in {TRACE_MODE_RAW, TRACE_MODE_HASH_ONLY}:
-            raise ValueError(
-                "VLLM_MOONCAKE_TRACE_MODE must be 'raw' or 'hash_only', "
-                f"got {mode!r}"
-            )
-
         return cls(
             enabled=_env_flag("VLLM_MOONCAKE_TRACE_ENABLED", False),
             path=Path(os.getenv("VLLM_MOONCAKE_TRACE_PATH", DEFAULT_TRACE_PATH)),
-            mode=mode,
-            session_header=os.getenv(
-                "VLLM_MOONCAKE_TRACE_SESSION_HEADER", "x-session-id"
-            ).strip(),
-            session_body_path=os.getenv("VLLM_MOONCAKE_TRACE_SESSION_BODY_PATH"),
             block_size=_env_int(
                 "VLLM_MOONCAKE_TRACE_BLOCK_SIZE", DEFAULT_BLOCK_SIZE
             ),
             max_body_bytes=_env_int(
                 "VLLM_MOONCAKE_TRACE_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES
-            ),
-            include_response_text=_env_flag(
-                "VLLM_MOONCAKE_TRACE_INCLUDE_RESPONSE_TEXT", False
             ),
             tokenizer_name=os.getenv("VLLM_MOONCAKE_TRACE_TOKENIZER"),
         )
@@ -104,86 +78,33 @@ class BufferedRequestBody:
     exceeded_limit: bool
 
 
-class OrderedJSONLTraceWriter:
-    """Concurrency-safe ordered JSONL appender."""
+class _JSONLTraceWriter:
+    """Concurrency-safe JSONL appender."""
 
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
         self._lock = threading.Lock()
-        self._next_sequence = 0
-        self._next_flush_sequence = 0
-        self._pending: dict[int, tuple[int, dict[str, Any] | None]] = {}
-        self._base_timestamp_ms: int | None = None
 
     @property
     def path(self) -> Path:
         """Return the destination JSONL path."""
         return self._path
 
-    def reserve_sequence(self) -> int:
-        """Reserve a sequence number for a newly accepted request."""
-        with self._lock:
-            sequence = self._next_sequence
-            self._next_sequence += 1
-            return sequence
-
-    def complete(
-        self,
-        sequence: int,
-        captured_at_unix_ms: int,
-        record: dict[str, Any] | None,
-    ) -> None:
-        """Mark a sequence as complete and flush any contiguous ready records."""
-        with self._lock:
-            self._pending[sequence] = (captured_at_unix_ms, record)
-            self._flush_locked()
-
-    def _flush_locked(self) -> None:
-        ready: list[tuple[int, dict[str, Any]]] = []
-        while self._next_flush_sequence in self._pending:
-            captured_at_unix_ms, record = self._pending.pop(self._next_flush_sequence)
-            self._next_flush_sequence += 1
-            if record is not None:
-                ready.append((captured_at_unix_ms, record))
-
-        if not ready:
+    def append(self, record: dict[str, Any] | None) -> None:
+        """Append a single record when one was captured."""
+        if record is None:
             return
 
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self._path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            self._ensure_base_timestamp_locked(ready[0][0])
-            assert self._base_timestamp_ms is not None
-
-            for captured_at_unix_ms, record in ready:
-                serialized = dict(record)
-                serialized["captured_at_unix_ms"] = captured_at_unix_ms
-                serialized["timestamp"] = captured_at_unix_ms - self._base_timestamp_ms
-                line = json.dumps(serialized, separators=(",", ":"), ensure_ascii=True)
+        line = json.dumps(record, separators=(",", ":"), ensure_ascii=True)
+        with self._lock:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(self._path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
                 os.write(fd, line.encode("utf-8") + b"\n")
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
-
-    def _ensure_base_timestamp_locked(self, fallback_timestamp_ms: int) -> None:
-        if self._base_timestamp_ms is not None:
-            return
-
-        if self._path.exists() and self._path.stat().st_size > 0:
-            with self._path.open("r", encoding="utf-8") as handle:
-                first_line = handle.readline().strip()
-            if first_line:
-                try:
-                    first_record = json.loads(first_line)
-                except json.JSONDecodeError:
-                    first_record = {}
-                captured_at_unix_ms = first_record.get("captured_at_unix_ms")
-                if isinstance(captured_at_unix_ms, int):
-                    self._base_timestamp_ms = captured_at_unix_ms
-                    return
-
-        self._base_timestamp_ms = fallback_timestamp_ms
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
 
 
 @dataclass(slots=True)
@@ -252,7 +173,6 @@ class ResponseCapture:
         self.completion_tokens: int | None = None
         self.output_length_source: str | None = None
         self.input_length_source: str | None = None
-        self.response_text_parts: list[str] = []
         self.non_streaming_body = bytearray()
         self._stream_parser = StreamSSEParser()
 
@@ -261,7 +181,7 @@ class ResponseCapture:
         """Return whether the downstream response is SSE."""
         return self.content_type == "text/event-stream"
 
-    async def observe(self, message: ASGIMessage) -> None:
+    def observe(self, message: ASGIMessage) -> None:
         """Observe an ASGI response message."""
         if message["type"] == "http.response.start":
             self.status_code = message["status"]
@@ -305,10 +225,6 @@ class ResponseCapture:
                 self.completion_tokens = completion_tokens
                 self.output_length_source = "usage.completion_tokens"
 
-        response_text = _extract_non_streaming_response_text(payload)
-        if response_text:
-            self.response_text_parts.append(response_text)
-
     def _consume_stream_payload(self, payload: str) -> None:
         if payload == "[DONE]":
             return
@@ -332,16 +248,6 @@ class ResponseCapture:
                 self.completion_tokens = completion_tokens
                 self.output_length_source = "usage.completion_tokens"
 
-        content = _extract_stream_response_text(chunk)
-        if content:
-            self.response_text_parts.append(content)
-
-    def response_text(self) -> str | None:
-        """Join streamed or non-streamed assistant text when it was collected."""
-        if not self.response_text_parts:
-            return None
-        return "".join(self.response_text_parts)
-
 
 def _decode_headers(raw_headers: Iterable[tuple[bytes, bytes]]) -> dict[str, str]:
     headers: dict[str, str] = {}
@@ -350,77 +256,9 @@ def _decode_headers(raw_headers: Iterable[tuple[bytes, bytes]]) -> dict[str, str
     return headers
 
 
-def _extract_body_path(payload: Any, path: str | None) -> Any:
-    if not path:
-        return None
-
-    current = payload
-    for part in path.split("."):
-        if not isinstance(current, dict) or part not in current:
-            return None
-        current = current[part]
-    return current
-
-
 def _json_get_string(payload: dict[str, Any], key: str) -> str | None:
     value = payload.get(key)
     return value if isinstance(value, str) else None
-
-
-def _normalize_scalar(value: Any) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value
-    if isinstance(value, (int, float, bool)):
-        return str(value)
-    return None
-
-
-def _extract_non_streaming_response_text(payload: dict[str, Any]) -> str:
-    choices = payload.get("choices")
-    if not isinstance(choices, list):
-        return ""
-
-    parts: list[str] = []
-    for choice in choices:
-        if not isinstance(choice, dict):
-            continue
-        message = choice.get("message")
-        if not isinstance(message, dict):
-            continue
-        parts.append(_content_to_text(message.get("content")))
-    return "".join(part for part in parts if part)
-
-
-def _extract_stream_response_text(payload: dict[str, Any]) -> str:
-    choices = payload.get("choices")
-    if not isinstance(choices, list):
-        return ""
-
-    parts: list[str] = []
-    for choice in choices:
-        if not isinstance(choice, dict):
-            continue
-        delta = choice.get("delta")
-        if not isinstance(delta, dict):
-            continue
-        parts.append(_content_to_text(delta.get("content")))
-    return "".join(part for part in parts if part)
-
-
-def _content_to_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") == "text" and isinstance(item.get("text"), str):
-                parts.append(item["text"])
-        return "".join(parts)
-    return ""
 
 
 def _count_tokens(bundle: WriterBundle, text: str) -> int | None:
@@ -510,16 +348,47 @@ def _replay_receive(
     return _inner
 
 
-def _build_hash_only_record(
+def _parse_request_json(buffered_request: BufferedRequestBody) -> dict[str, Any] | None:
+    if buffered_request.exceeded_limit or buffered_request.body is None:
+        return None
+
+    try:
+        request_json = json.loads(buffered_request.body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+    return request_json if isinstance(request_json, dict) else None
+
+
+def _build_trace_record(
     *,
-    config: TraceConfig,
-    record: dict[str, Any],
-    model_name: str | None,
-    messages: list[Any],
-    tools: list[Any] | None,
+    arrival_unix_ms: int,
+    request_headers: dict[str, str],
+    request_json: dict[str, Any],
     response_capture: ResponseCapture,
     writer_cache: MooncakeWriterCache,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
+    if response_capture.status_code is None or response_capture.status_code >= 300:
+        return None
+
+    messages = request_json.get("messages")
+    if not isinstance(messages, list):
+        return None
+
+    model_name = _json_get_string(request_json, "model")
+    tools = request_json.get("tools") if isinstance(request_json.get("tools"), list) else None
+
+    request_id = (
+        request_headers.get("x-request-id")
+        or response_capture.response_header_request_id
+        or response_capture.response_id
+        or uuid.uuid4().hex
+    )
+
+    record: dict[str, Any] = {"request_id": request_id, "timestamp": arrival_unix_ms}
+    if model_name:
+        record["model"] = model_name
+
     input_length = response_capture.prompt_tokens
     output_length = response_capture.completion_tokens
     prompt_token_count: int | None = None
@@ -536,15 +405,6 @@ def _build_hash_only_record(
             if input_length is None and prompt_token_count is not None:
                 input_length = prompt_token_count
                 response_capture.input_length_source = "rendered_prompt_tokenization"
-
-            if output_length is None:
-                response_text = response_capture.response_text()
-                if response_text:
-                    output_length = _count_tokens(bundle, response_text)
-                    if output_length is not None:
-                        response_capture.output_length_source = (
-                            "response_text_tokenization"
-                        )
         except Exception as exc:
             record["hash_ids"] = []
             hash_error = f"{type(exc).__name__}: {exc}"
@@ -579,68 +439,6 @@ def _build_hash_only_record(
     return record
 
 
-def _build_trace_record(
-    *,
-    config: TraceConfig,
-    request_headers: dict[str, str],
-    request_json: dict[str, Any],
-    response_capture: ResponseCapture,
-    writer_cache: MooncakeWriterCache,
-) -> dict[str, Any] | None:
-    if response_capture.status_code is None or response_capture.status_code >= 300:
-        return None
-
-    messages = request_json.get("messages")
-    if not isinstance(messages, list):
-        return None
-
-    model_name = _json_get_string(request_json, "model")
-    tools = request_json.get("tools") if isinstance(request_json.get("tools"), list) else None
-
-    session_id = _normalize_scalar(request_headers.get(config.session_header.lower()))
-    if session_id is None:
-        session_id = _normalize_scalar(
-            _extract_body_path(request_json, config.session_body_path)
-        )
-
-    request_id = (
-        request_headers.get("x-request-id")
-        or response_capture.response_header_request_id
-        or response_capture.response_id
-        or uuid.uuid4().hex
-    )
-
-    record: dict[str, Any] = {"request_id": request_id}
-    if model_name:
-        record["model"] = model_name
-    if session_id:
-        record["session_id"] = session_id
-
-    if config.mode == TRACE_MODE_RAW:
-        record["messages"] = messages
-        if tools is not None:
-            record["tools"] = tools
-        if response_capture.completion_tokens is not None:
-            record["output_length"] = response_capture.completion_tokens
-        if response_capture.output_length_source:
-            record["output_length_source"] = response_capture.output_length_source
-        if config.include_response_text:
-            response_text = response_capture.response_text()
-            if response_text:
-                record["response_text"] = response_text
-        return record
-
-    return _build_hash_only_record(
-        config=config,
-        record=record,
-        model_name=model_name,
-        messages=messages,
-        tools=tools,
-        response_capture=response_capture,
-        writer_cache=writer_cache,
-    )
-
-
 class VLLMMooncakeTraceMiddleware:
     """ASGI middleware that captures vLLM chat completion traces."""
 
@@ -649,13 +447,12 @@ class VLLMMooncakeTraceMiddleware:
         app: ASGIApp,
         *,
         config: TraceConfig | None = None,
-        writer: OrderedJSONLTraceWriter | None = None,
         writer_cache: MooncakeWriterCache | None = None,
         clock: Callable[[], int] | None = None,
     ) -> None:
         self.app = app
         self.config = config or TraceConfig.from_env()
-        self.writer = writer or OrderedJSONLTraceWriter(self.config.path)
+        self.writer = _JSONLTraceWriter(self.config.path)
         self.writer_cache = writer_cache or MooncakeWriterCache(
             tokenizer_override=self.config.tokenizer_name,
             block_size=self.config.block_size,
@@ -669,43 +466,34 @@ class VLLMMooncakeTraceMiddleware:
             await self.app(scope, receive, send)
             return
 
-        captured_at_unix_ms = self.clock()
-        sequence = self.writer.reserve_sequence()
+        arrival_unix_ms = self.clock()
         request_headers = _decode_headers(scope.get("headers", []))
         buffered_request = await _read_request_body(
             receive, max_body_bytes=self.config.max_body_bytes
         )
         replay_receive = _replay_receive(buffered_request.messages, receive)
-
-        if buffered_request.exceeded_limit or buffered_request.body is None:
-            self.writer.complete(sequence, captured_at_unix_ms, None)
-            await self.app(scope, replay_receive, send)
-            return
-
-        try:
-            request_json = json.loads(buffered_request.body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            self.writer.complete(sequence, captured_at_unix_ms, None)
+        request_json = _parse_request_json(buffered_request)
+        if request_json is None:
             await self.app(scope, replay_receive, send)
             return
 
         response_capture = ResponseCapture()
 
         async def send_wrapper(message: ASGIMessage) -> None:
-            await response_capture.observe(message)
+            response_capture.observe(message)
             await send(message)
 
         await self.app(scope, replay_receive, send_wrapper)
         response_capture.finalize()
 
         record = _build_trace_record(
-            config=self.config,
+            arrival_unix_ms=arrival_unix_ms,
             request_headers=request_headers,
             request_json=request_json,
             response_capture=response_capture,
             writer_cache=self.writer_cache,
         )
-        self.writer.complete(sequence, captured_at_unix_ms, record)
+        self.writer.append(record)
 
     def _should_trace(self, scope: dict[str, Any]) -> bool:
         if not self.config.enabled:
@@ -719,7 +507,6 @@ class VLLMMooncakeTraceMiddleware:
 
 __all__ = [
     "MooncakeWriterCache",
-    "OrderedJSONLTraceWriter",
     "TraceConfig",
     "VLLMMooncakeTraceMiddleware",
 ]

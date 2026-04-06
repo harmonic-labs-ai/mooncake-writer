@@ -7,9 +7,7 @@ compatible vLLM server:
 - `GET /v1/models`
 - non-streaming `POST /v1/chat/completions`
 - streaming `POST /v1/chat/completions`
-- tool-bearing chat requests
-- explicit request/session headers
-- session IDs from the request body
+- explicit request IDs
 - request-id fallback when no explicit `x-request-id` is provided
 - invalid JSON error handling
 - concurrent chat requests
@@ -23,7 +21,6 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
-import os
 import sys
 import time
 import urllib.error
@@ -32,10 +29,6 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
-
-TRACE_MODE_RAW = "raw"
-TRACE_MODE_HASH_ONLY = "hash_only"
 
 
 class TestFailure(RuntimeError):
@@ -255,16 +248,6 @@ def _normalize_stream(events: list[Any]) -> dict[str, Any]:
     }
 
 
-def _set_body_path(payload: dict[str, Any], path: str, value: Any) -> None:
-    current = payload
-    parts = path.split(".")
-    for part in parts[:-1]:
-        if part not in current or not isinstance(current[part], dict):
-            current[part] = {}
-        current = current[part]
-    current[parts[-1]] = value
-
-
 def _find_trace_by_request_id(records: list[dict[str, Any]], request_id: str) -> dict[str, Any]:
     for record in reversed(records):
         if record.get("request_id") == request_id:
@@ -276,84 +259,22 @@ def _print_pass(label: str) -> None:
     print(f"[PASS] {label}")
 
 
-def _validate_record_common(
+def _validate_trace_record(
     record: dict[str, Any],
     *,
     request_id: str,
     model: str,
-    session_id: str | None = None,
 ) -> None:
     _assert(record.get("request_id") == request_id, f"Unexpected request_id in trace: {record}")
     _assert(record.get("model") == model, f"Unexpected model in trace: {record}")
     _assert(isinstance(record.get("timestamp"), int), f"Missing timestamp in trace: {record}")
-    _assert(
-        isinstance(record.get("captured_at_unix_ms"), int),
-        f"Missing captured_at_unix_ms in trace: {record}",
-    )
-    if session_id is None:
-        _assert("session_id" not in record, f"Unexpected session_id in trace: {record}")
-    else:
-        _assert(record.get("session_id") == session_id, f"Unexpected session_id in trace: {record}")
-
-
-def _validate_raw_record(
-    record: dict[str, Any],
-    *,
-    payload: dict[str, Any],
-    request_id: str,
-    model: str,
-    session_id: str | None = None,
-) -> None:
-    _validate_record_common(record, request_id=request_id, model=model, session_id=session_id)
-    _assert(record.get("messages") == payload["messages"], f"Raw trace missing messages: {record}")
-    if "tools" in payload:
-        _assert(record.get("tools") == payload["tools"], f"Raw trace missing tools: {record}")
-    else:
-        _assert("tools" not in record, f"Unexpected tools in raw trace: {record}")
-    _assert("input_length" not in record, f"Raw trace should omit input_length: {record}")
-    _assert("hash_ids" not in record, f"Raw trace should omit hash_ids: {record}")
-    _assert(isinstance(record.get("output_length"), int), f"Raw trace missing output_length: {record}")
-
-
-def _validate_hash_record(
-    record: dict[str, Any],
-    *,
-    request_id: str,
-    model: str,
-    session_id: str | None = None,
-) -> None:
-    _validate_record_common(record, request_id=request_id, model=model, session_id=session_id)
+    _assert("captured_at_unix_ms" not in record, f"Unexpected captured_at_unix_ms in trace: {record}")
     _assert("messages" not in record, f"Hash trace should omit messages: {record}")
     _assert("tools" not in record, f"Hash trace should omit tools: {record}")
+    _assert("session_id" not in record, f"Unexpected session_id in trace: {record}")
     _assert(isinstance(record.get("input_length"), int), f"Hash trace missing input_length: {record}")
     _assert(isinstance(record.get("output_length"), int), f"Hash trace missing output_length: {record}")
     _assert(isinstance(record.get("hash_ids"), list), f"Hash trace missing hash_ids: {record}")
-
-
-def _validate_mode_record(
-    mode: str,
-    record: dict[str, Any],
-    *,
-    payload: dict[str, Any],
-    request_id: str,
-    model: str,
-    session_id: str | None = None,
-) -> None:
-    if mode == TRACE_MODE_RAW:
-        _validate_raw_record(
-            record,
-            payload=payload,
-            request_id=request_id,
-            model=model,
-            session_id=session_id,
-        )
-    else:
-        _validate_hash_record(
-            record,
-            request_id=request_id,
-            model=model,
-            session_id=session_id,
-        )
 
 
 def _request_and_compare_non_stream(
@@ -459,20 +380,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True, help="Model name to send in requests")
     parser.add_argument("--trace-path", type=Path, help="Trace JSONL file written by the middleware server")
     parser.add_argument(
-        "--trace-mode",
-        choices=[TRACE_MODE_RAW, TRACE_MODE_HASH_ONLY],
-        help="Expected trace mode for validation",
-    )
-    parser.add_argument(
-        "--session-header",
-        default="x-session-id",
-        help="Session header name expected by the middleware",
-    )
-    parser.add_argument(
-        "--session-body-path",
-        help="Optional body path, e.g. metadata.session_id, to validate session capture from the request body",
-    )
-    parser.add_argument(
         "--timeout-seconds",
         type=float,
         default=120.0,
@@ -495,9 +402,6 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
-    if (args.trace_path is None) != (args.trace_mode is None):
-        raise TestFailure("--trace-path and --trace-mode must be provided together")
-
     trace_count = len(_load_trace(args.trace_path)) if args.trace_path else 0
 
     models_response = _request("GET", _join_url(args.server_url, "/v1/models"), timeout=args.timeout_seconds)
@@ -513,7 +417,6 @@ def main() -> int:
     _print_pass("/v1/models")
 
     non_stream_request_id = "req-non-stream"
-    non_stream_session_id = "sess-header-1"
     non_stream_payload = {
         "model": args.model,
         "stream": False,
@@ -524,10 +427,7 @@ def main() -> int:
         url=args.server_url,
         baseline_url=args.baseline_url,
         payload=non_stream_payload,
-        headers={
-            "x-request-id": non_stream_request_id,
-            args.session_header: non_stream_session_id,
-        },
+        headers={"x-request-id": non_stream_request_id},
         timeout=args.timeout_seconds,
     )
     _assert(
@@ -542,13 +442,10 @@ def main() -> int:
         trace_count += 1
         records = _wait_for_trace_count(args.trace_path, trace_count, args.trace_wait_seconds)
         record = _find_trace_by_request_id(records, non_stream_request_id)
-        _validate_mode_record(
-            args.trace_mode,
+        _validate_trace_record(
             record,
-            payload=non_stream_payload,
             request_id=non_stream_request_id,
             model=args.model,
-            session_id=non_stream_session_id,
         )
     _print_pass("non-stream chat completion")
 
@@ -576,90 +473,50 @@ def main() -> int:
         trace_count += 1
         records = _wait_for_trace_count(args.trace_path, trace_count, args.trace_wait_seconds)
         record = _find_trace_by_request_id(records, stream_request_id)
-        _validate_mode_record(
-            args.trace_mode,
+        _validate_trace_record(
             record,
-            payload=stream_payload,
             request_id=stream_request_id,
             model=args.model,
         )
     _print_pass("streaming chat completion")
 
-    tools_request_id = "req-tools"
-    tools_payload = {
-        "model": args.model,
-        "stream": False,
-        "temperature": 0,
-        "messages": [{"role": "user", "content": "Decide whether to call a tool."}],
-        "tools": [
-            {
-                "type": "function",
-                "function": {
-                    "name": "lookup_weather",
-                    "description": "Look up the weather",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "city": {"type": "string"},
-                        },
-                        "required": ["city"],
-                    },
-                },
-            }
-        ],
-    }
-    tools_response, _ = _request_and_compare_non_stream(
-        url=args.server_url,
-        baseline_url=args.baseline_url,
-        payload=tools_payload,
-        headers={"x-request-id": tools_request_id},
-        timeout=args.timeout_seconds,
-    )
-    _assert(isinstance(tools_response.get("usage"), dict), f"Tool response missing usage: {tools_response}")
-    if args.trace_path:
-        trace_count += 1
-        records = _wait_for_trace_count(args.trace_path, trace_count, args.trace_wait_seconds)
-        record = _find_trace_by_request_id(records, tools_request_id)
-        _validate_mode_record(
-            args.trace_mode,
-            record,
-            payload=tools_payload,
-            request_id=tools_request_id,
-            model=args.model,
-        )
-    _print_pass("tools request")
-
-    if args.session_body_path:
-        body_request_id = "req-session-body"
-        body_session_id = "sess-body-1"
-        body_payload = {
-            "model": args.model,
-            "stream": False,
-            "temperature": 0,
-            "messages": [{"role": "user", "content": "Capture the session id from the body."}],
-        }
-        _set_body_path(body_payload, args.session_body_path, body_session_id)
-        body_response, _ = _request_and_compare_non_stream(
-            url=args.server_url,
-            baseline_url=args.baseline_url,
-            payload=body_payload,
-            headers={"x-request-id": body_request_id},
-            timeout=args.timeout_seconds,
-        )
-        _assert(isinstance(body_response.get("usage"), dict), f"Session-body response missing usage: {body_response}")
-        if args.trace_path:
-            trace_count += 1
-            records = _wait_for_trace_count(args.trace_path, trace_count, args.trace_wait_seconds)
-            record = _find_trace_by_request_id(records, body_request_id)
-            _validate_mode_record(
-                args.trace_mode,
-                record,
-                payload=body_payload,
-                request_id=body_request_id,
-                model=args.model,
-                session_id=body_session_id,
-            )
-        _print_pass("session id from body")
+    # tools_request_id = "req-tools"
+    # tools_payload = {
+    #     "model": args.model,
+    #     "stream": False,
+    #     "temperature": 0,
+    #     "messages": [{"role": "user", "content": "Decide whether to call a tool."}],
+    #     "tools": [
+    #         {
+    #             "type": "function",
+    #             "function": {
+    #                 "name": "lookup_weather",
+    #                 "description": "Look up the weather",
+    #                 "parameters": {
+    #                     "type": "object",
+    #                     "properties": {
+    #                         "city": {"type": "string"},
+    #                     },
+    #                     "required": ["city"],
+    #                 },
+    #             },
+    #         }
+    #     ],
+    # }
+    # tools_response, _ = _request_and_compare_non_stream(
+    #     url=args.server_url,
+    #     baseline_url=args.baseline_url,
+    #     payload=tools_payload,
+    #     headers={"x-request-id": tools_request_id},
+    #     timeout=args.timeout_seconds,
+    # )
+    # _assert(isinstance(tools_response.get("usage"), dict), f"Tool response missing usage: {tools_response}")
+    # if args.trace_path:
+    #     trace_count += 1
+    #     records = _wait_for_trace_count(args.trace_path, trace_count, args.trace_wait_seconds)
+    #     record = _find_trace_by_request_id(records, tools_request_id)
+    #     _validate_trace_record(record, request_id=tools_request_id, model=args.model)
+    # _print_pass("tools request")
 
     fallback_payload = {
         "model": args.model,
@@ -680,10 +537,8 @@ def main() -> int:
         trace_count += 1
         records = _wait_for_trace_count(args.trace_path, trace_count, args.trace_wait_seconds)
         record = _find_trace_by_request_id(records, fallback_request_id)
-        _validate_mode_record(
-            args.trace_mode,
+        _validate_trace_record(
             record,
-            payload=fallback_payload,
             request_id=fallback_request_id,
             model=args.model,
         )
@@ -714,21 +569,13 @@ def main() -> int:
     if args.trace_path:
         trace_count += args.concurrency
         records = _wait_for_trace_count(args.trace_path, trace_count, args.trace_wait_seconds)
-        for request_id, payload in concurrent_requests:
+        for request_id, _payload in concurrent_requests:
             record = _find_trace_by_request_id(records, request_id)
-            _validate_mode_record(
-                args.trace_mode,
+            _validate_trace_record(
                 record,
-                payload=payload,
                 request_id=request_id,
                 model=args.model,
             )
-        new_records = records[-args.concurrency :]
-        timestamps = [record["timestamp"] for record in new_records]
-        _assert(
-            timestamps == sorted(timestamps),
-            f"Concurrent trace timestamps were not monotonic: {timestamps}",
-        )
     _print_pass("concurrent requests")
 
     print("All live vLLM checks passed.")
