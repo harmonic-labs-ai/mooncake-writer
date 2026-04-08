@@ -2,6 +2,11 @@
 
 A cloneable demo showing how to capture [Mooncake traces](https://github.com/kvcache-ai/Mooncake) using the `mooncake-writer` library (a small wrapper around [AIPerf](https://github.com/ai-dynamo/aiperf)).
 
+The repo now includes two demo surfaces:
+
+1. A notebook-oriented `MooncakeWriter` API for converting text to hash blocks
+2. An importable ASGI middleware for capturing real `vLLM` OpenAI-compatible chat traffic
+
 ## Related Resources
 
 - [Mooncake project](https://github.com/kvcache-ai/Mooncake)
@@ -37,15 +42,7 @@ cd mooncake-writer
 uv sync --all-extras
 ```
 
-### Run the Demo
-
-Open the notebook and step through the cells:
-
-```bash
-uv run jupyter notebook demo.ipynb
-```
-
-## Quick Example
+### Quick Example
 
 ```python
 import time
@@ -69,13 +66,20 @@ writer.capture(
 writer.write_trace("trace.jsonl")
 ```
 
-## What's in the Notebook
+
+## Interactive Demo
+
+Open the notebook and step through the cells:
+
+```bash
+uv run jupyter notebook demo.ipynb
+```
 
 The [`demo.ipynb`](demo.ipynb) notebook walks through:
 
 1. **Initialising** a `MooncakeWriter` with a HuggingFace tokenizer
 2. **Converting text to hash blocks** — tokenize, chunk, and hash a single string
-3. **Reconstructing text from hashes** — round-trip back to text
+3. **Reconstructing text from hashes** — round-trip back to synthetic text
 4. **Batch operations** — convert multiple texts at once and observe shared prefix hash IDs
 5. **Custom block sizes** — adjust the token-per-block granularity
 6. **Cross-request prefix sharing** — detect shared prefixes across separate calls
@@ -96,3 +100,51 @@ The [`demo.ipynb`](demo.ipynb) notebook walks through:
 | `reset_hashes()` | Reset the internal hasher (clears hash-to-ID mappings) |
 
 `text_to_hashes`, `texts_to_hashes`, `hashes_to_text`, and `hashes_to_texts` accept an optional `block_size` override.
+
+## vLLM Chat Trace Capture
+
+`mooncake_writer.middleware.VLLMMooncakeTraceMiddleware` captures `POST /v1/chat/completions`
+traffic via vLLM ASGI middleware extension.
+
+### Usage
+
+Use the middleware with `vllm serve` and the request-ID / usage flags enabled:
+
+```bash
+export VLLM_MOONCAKE_TRACE_ENABLED=true
+
+vllm serve Qwen/Qwen3-0.6B \
+  --middleware mooncake_writer.middleware.VLLMMooncakeTraceMiddleware \
+  --enable-request-id-headers \
+  --enable-force-include-usage
+```
+
+### Config
+
+| Variable | Default | Notes |
+|---|---|---|
+| `VLLM_MOONCAKE_TRACE_ENABLED` | `false` | Global on/off switch |
+| `VLLM_MOONCAKE_TRACE_PATH` | `vllm_mooncake_traces.jsonl` | Append-only JSONL output |
+| `VLLM_MOONCAKE_TRACE_BLOCK_SIZE` | `512` | Passed directly to `MooncakeWriter(block_size=...)` |
+| `VLLM_MOONCAKE_TRACE_MAX_BODY_BYTES` | `1048576` | Requests above this size are passed through but not captured |
+| `VLLM_MOONCAKE_TRACE_TOKENIZER` | *(model name from request)* | Override the HuggingFace tokenizer used for hashing; defaults to the `model` field in each request |
+
+
+### Replay With AIPerf
+
+Use the trace file when replaying with the Mooncake trace loader. These traces
+store absolute arrival timestamps, so enable fixed-schedule auto-offset when replaying:
+
+```bash
+aiperf profile \
+  --model Qwen/Qwen3-0.6B \
+  --endpoint-type chat \
+  --streaming \
+  --url http://127.0.0.1:8000/v1 \
+  --input-file /tmp/vllm-chat-traces.jsonl \
+  --custom-dataset-type mooncake_trace \
+  --fixed-schedule \
+  --fixed-schedule-auto-offset
+```
+
+
