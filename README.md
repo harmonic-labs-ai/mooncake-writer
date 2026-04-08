@@ -127,6 +127,7 @@ vllm serve Qwen/Qwen3-0.6B \
 | `VLLM_MOONCAKE_TRACE_PATH` | `vllm_mooncake_traces.jsonl` | Append-only JSONL output |
 | `VLLM_MOONCAKE_TRACE_BLOCK_SIZE` | `512` | Passed directly to `MooncakeWriter(block_size=...)` |
 | `VLLM_MOONCAKE_TRACE_MAX_BODY_BYTES` | `1048576` | Requests above this size are passed through but not captured |
+| `VLLM_MOONCAKE_TRACE_TOKENIZER` | *(model name from request)* | Override the HuggingFace tokenizer used for hashing; defaults to the `model` field in each request |
 
 
 ### Replay With AIPerf
