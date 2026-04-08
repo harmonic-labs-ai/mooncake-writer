@@ -76,10 +76,10 @@ writer.write_trace("trace.jsonl")
 
 ## vLLM Chat Trace Capture
 
-`mooncake_writer.vllm_trace.VLLMMooncakeTraceMiddleware` captures `POST /v1/chat/completions`
-traffic at the ASGI boundary and appends JSONL traces for later replay. In
-`hash_only` mode it renders the effective chat prompt, then hands that prompt to
-the existing `MooncakeWriter` implementation in this repo.
+`mooncake_writer.middleware.VLLMMooncakeTraceMiddleware` captures `POST /v1/chat/completions`
+traffic at the ASGI boundary and appends hash-only JSONL traces for later replay.
+It renders the effective chat prompt, then hands that prompt to the existing
+`MooncakeWriter` implementation in this repo.
 
 ### Enable It
 
@@ -87,23 +87,12 @@ Use the middleware with `vllm serve` and the request-ID / usage flags enabled:
 
 ```bash
 export VLLM_MOONCAKE_TRACE_ENABLED=true
-export VLLM_MOONCAKE_TRACE_PATH=/tmp/vllm-chat-traces.jsonl
-export VLLM_MOONCAKE_TRACE_MODE=hash_only
-export VLLM_MOONCAKE_TRACE_BLOCK_SIZE=512
-export VLLM_MOONCAKE_TRACE_SESSION_HEADER=x-session-id
-export VLLM_MOONCAKE_TRACE_MAX_BODY_BYTES=1048576
-export VLLM_MOONCAKE_TRACE_INCLUDE_RESPONSE_TEXT=false
 
-vllm serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-  --device cpu \
-  --middleware mooncake_writer.vllm_trace.VLLMMooncakeTraceMiddleware \
+vllm serve Qwen/Qwen3-0.6B \
+  --middleware mooncake_writer.middleware.VLLMMooncakeTraceMiddleware \
   --enable-request-id-headers \
   --enable-force-include-usage
 ```
-
-If your request `model` is an alias that is not directly loadable as a Hugging Face
-tokenizer, set `VLLM_MOONCAKE_TRACE_TOKENIZER=<tokenizer-or-model-name>` so
-`hash_only` mode can render the chat template locally.
 
 ### Config Knobs
 
@@ -111,29 +100,20 @@ tokenizer, set `VLLM_MOONCAKE_TRACE_TOKENIZER=<tokenizer-or-model-name>` so
 |---|---|---|
 | `VLLM_MOONCAKE_TRACE_ENABLED` | `false` | Global on/off switch |
 | `VLLM_MOONCAKE_TRACE_PATH` | `vllm_mooncake_traces.jsonl` | Append-only JSONL output |
-| `VLLM_MOONCAKE_TRACE_MODE` | `hash_only` | `raw` preserves chat messages; `hash_only` writes replay-oriented hash blocks |
-| `VLLM_MOONCAKE_TRACE_SESSION_HEADER` | `x-session-id` | Optional session ID header to copy into the record |
-| `VLLM_MOONCAKE_TRACE_SESSION_BODY_PATH` | unset | Dot path such as `metadata.session_id` |
 | `VLLM_MOONCAKE_TRACE_BLOCK_SIZE` | `512` | Passed directly to `MooncakeWriter(block_size=...)` |
 | `VLLM_MOONCAKE_TRACE_MAX_BODY_BYTES` | `1048576` | Requests above this size are passed through but not captured |
-| `VLLM_MOONCAKE_TRACE_INCLUDE_RESPONSE_TEXT` | `false` | Opt-in raw-mode response text capture |
-| `VLLM_MOONCAKE_TRACE_TOKENIZER` | unset | Optional tokenizer override for `hash_only` mode |
+| `VLLM_MOONCAKE_TRACE_TOKENIZER` | unset | Optional tokenizer override for local prompt rendering |
 
-### Sample Raw-Mode Line
-
-```json
-{"timestamp":0,"captured_at_unix_ms":1712400000000,"session_id":"sess-42","request_id":"req-123","model":"TinyLlama/TinyLlama-1.1B-Chat-v1.0","messages":[{"role":"user","content":"Say hello."}],"tools":[{"type":"function","function":{"name":"lookup_weather"}}],"output_length":17,"output_length_source":"usage.completion_tokens"}
-```
-
-### Sample Hash-Only Line
+### Sample Trace Line
 
 ```json
-{"timestamp":0,"captured_at_unix_ms":1712400000000,"session_id":"sess-42","request_id":"req-123","model":"TinyLlama/TinyLlama-1.1B-Chat-v1.0","input_length":48,"output_length":17,"input_length_source":"usage.prompt_tokens","output_length_source":"usage.completion_tokens","hash_ids":[0,1,2]}
+{"timestamp":1712400000000,"request_id":"req-123","model":"TinyLlama/TinyLlama-1.1B-Chat-v1.0","input_length":48,"output_length":17,"input_length_source":"usage.prompt_tokens","output_length_source":"usage.completion_tokens","hash_ids":[0,1,2]}
 ```
 
 ### Replay With AIPerf
 
-Use a `hash_only` trace file when replaying with the Mooncake trace loader:
+Use the trace file when replaying with the Mooncake trace loader. These traces
+store absolute arrival timestamps, so enable fixed-schedule auto-offset when replaying:
 
 ```bash
 aiperf profile \
@@ -143,18 +123,46 @@ aiperf profile \
   --url http://127.0.0.1:8000/v1 \
   --input-file /tmp/vllm-chat-traces.jsonl \
   --custom-dataset-type mooncake_trace \
-  --fixed-schedule
+  --fixed-schedule \
+  --fixed-schedule-auto-offset
 ```
+
+### Live Server Test Script
+
+Use the live smoke-test harness in [scripts/test_vllm_live_server.py](/Users/john/dev/mooncake-writer/scripts/test_vllm_live_server.py)
+to exercise a real vLLM server end to end. It covers:
+
+- `GET /v1/models`
+- non-streaming chat completions
+- streaming chat completions
+- request-id fallback
+- invalid JSON handling
+- concurrent requests
+- hash-only trace-file validation
+
+Example against a middleware-enabled server:
+
+```bash
+python /Users/john/dev/mooncake-writer/scripts/test_vllm_live_server.py \
+  --server-url http://127.0.0.1:8000 \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --trace-path /tmp/vllm-chat-traces.jsonl
+```
+
+If you also have a baseline server without middleware, add `--baseline-url http://127.0.0.1:8001`
+to compare normalized responses between the two servers.
 
 ### Limitations And Accuracy Notes
 
-- `raw` mode preserves incoming `messages` and optional `tools`, but it intentionally omits `input_length` and `hash_ids`.
-- `hash_only` mode uses exact `usage.prompt_tokens` / `usage.completion_tokens` when vLLM includes them, which is why `--enable-force-include-usage` is required.
-- Streaming capture preserves the SSE stream verbatim and reads the final usage chunk when present. If usage is missing, `output_length` falls back to local tokenization of streamed assistant text and is labeled with `output_length_source=response_text_tokenization`.
-- `hash_only` mode uses this repo's `MooncakeWriter.text_to_hashes()` over the rendered chat prompt. That means the hash IDs follow this repo's existing MooncakeWriter semantics rather than vLLM's internal block hash implementation.
-- If the local tokenizer cannot render a chat template, the middleware falls back to hashing a JSON representation of `messages` and `tools` and adds `hash_approximation` to the record.
+- Traces are always hash-only. They include derived token counts and `hash_ids`, not the original `messages` payload.
+- `timestamp` is the Unix-millisecond arrival time captured when the request enters the middleware.
+- The middleware uses exact `usage.prompt_tokens` / `usage.completion_tokens` when vLLM includes them, which is why `--enable-force-include-usage` is required for complete token counts.
+- Streaming capture preserves the SSE stream verbatim and reads the final usage chunk when present. If usage is missing, `input_length` can fall back to local tokenization of the rendered prompt and `output_length` is omitted.
+- The middleware assumes one effective tokenizer per server process. Set `VLLM_MOONCAKE_TRACE_TOKENIZER` when request `model` names are aliases or adapter names rather than directly loadable tokenizer IDs.
+- The middleware uses this repo's `MooncakeWriter.text_to_hashes()` over the rendered chat prompt. That means the hash IDs follow this repo's existing MooncakeWriter semantics rather than vLLM's internal block hash implementation.
+- If the local tokenizer cannot render a chat template, the middleware still writes the trace record but leaves `hash_ids` empty and records a `hash_error`.
 - v1 writes a single append-only file. It does not include built-in rotation.
-- The writer preserves request-arrival ordering within a single process. Multiple server processes can safely append to the same file without corrupting it, but cross-process line ordering is not guaranteed.
+- Records are appended when requests complete, so on-disk line order may differ from arrival order. Replay should use `--fixed-schedule-auto-offset`.
 
 ## What's in the Notebook
 

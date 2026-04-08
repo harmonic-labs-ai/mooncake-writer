@@ -7,42 +7,55 @@ import json
 from pathlib import Path
 from typing import Any
 
-from mooncake_writer.vllm_trace import (
+import mooncake_writer.middleware as middleware_module
+from mooncake_writer.middleware import (
+    ModelTraceRuntime,
     TraceConfig,
     VLLMMooncakeTraceMiddleware,
 )
 
 
-class FakeAIPerfTokenizer:
-    """Tokenizer stub used by the fake MooncakeWriter."""
-
-    def __init__(self, encoded_lengths: dict[str, int] | None = None) -> None:
-        self.encoded_lengths = encoded_lengths or {}
-
-    def encode(self, text: str) -> list[int]:
-        return list(range(self.encoded_lengths.get(text, len(text))))
-
-
-class FakeMooncakeWriter:
-    """Small MooncakeWriter stub for middleware tests."""
+class FakeRuntime:
+    """Runtime stub for middleware tests."""
 
     def __init__(
         self,
         *,
+        rendered_prompt: str = "rendered prompt",
         hash_ids: list[int] | None = None,
         encoded_lengths: dict[str, int] | None = None,
-        error: Exception | None = None,
+        render_error: Exception | None = None,
+        hash_error: Exception | None = None,
     ) -> None:
+        self.rendered_prompt = rendered_prompt
         self.hash_ids = hash_ids or [11, 12]
-        self.tokenizer = FakeAIPerfTokenizer(encoded_lengths=encoded_lengths)
-        self.error = error
-        self.prompts: list[str] = []
+        self.encoded_lengths = encoded_lengths or {}
+        self.render_error = render_error
+        self.hash_error = hash_error
+        self.render_calls: list[dict[str, Any]] = []
+        self.hash_prompts: list[str] = []
 
-    def text_to_hashes(self, text: str) -> list[int]:
-        if self.error is not None:
-            raise self.error
-        self.prompts.append(text)
+    def render_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+    ) -> str:
+        assert isinstance(messages, list)
+        if tools is not None:
+            assert isinstance(tools, list)
+        if self.render_error is not None:
+            raise self.render_error
+        self.render_calls.append({"messages": messages, "tools": tools})
+        return self.rendered_prompt
+
+    def hash_prompt(self, text: str) -> list[int]:
+        if self.hash_error is not None:
+            raise self.hash_error
+        self.hash_prompts.append(text)
         return list(self.hash_ids)
+
+    def count_tokens(self, text: str) -> int | None:
+        return self.encoded_lengths.get(text, len(text))
 
 
 class FakeChatTokenizer:
@@ -65,32 +78,6 @@ class FakeChatTokenizer:
         if tools is not None:
             assert isinstance(tools, list)
         return self.rendered_prompt
-
-
-class NoChatTemplateTokenizer:
-    """Tokenizer stub that forces the JSON fallback rendering path."""
-
-    pass
-
-
-class FakeWriterBundle:
-    """Writer bundle test double."""
-
-    def __init__(self, writer: FakeMooncakeWriter, chat_tokenizer: FakeChatTokenizer) -> None:
-        self.writer = writer
-        self.chat_tokenizer = chat_tokenizer
-
-
-class FakeWriterCache:
-    """MooncakeWriter cache stub."""
-
-    def __init__(self, bundle: FakeWriterBundle) -> None:
-        self.bundle = bundle
-        self.models: list[str] = []
-
-    def get(self, model_name: str) -> FakeWriterBundle:
-        self.models.append(model_name)
-        return self.bundle
 
 
 def _make_scope(*, headers: dict[str, str] | None = None) -> dict[str, Any]:
@@ -143,15 +130,9 @@ def test_trace_uses_mooncake_writer(tmp_path: Path) -> None:
         "messages": [{"role": "user", "content": "hello"}],
         "tools": [{"type": "function", "function": {"name": "lookup"}}],
     }
-    fake_writer = FakeMooncakeWriter(
+    runtime = FakeRuntime(
         hash_ids=[101, 202, 303],
         encoded_lengths={"rendered prompt": 5},
-    )
-    writer_cache = FakeWriterCache(
-        FakeWriterBundle(
-            writer=fake_writer,
-            chat_tokenizer=FakeChatTokenizer(rendered_prompt="rendered prompt"),
-        )
     )
 
     async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
@@ -179,7 +160,7 @@ def test_trace_uses_mooncake_writer(tmp_path: Path) -> None:
     middleware = VLLMMooncakeTraceMiddleware(
         app,
         config=TraceConfig(enabled=True, path=path),
-        writer_cache=writer_cache,
+        runtime=runtime,
         clock=lambda: 2_000,
     )
 
@@ -192,13 +173,11 @@ def test_trace_uses_mooncake_writer(tmp_path: Path) -> None:
     )
 
     [record] = _read_jsonl(path)
-    assert writer_cache.models == ["demo-model"]
-    assert fake_writer.prompts == ["rendered prompt"]
+    assert runtime.hash_prompts == ["rendered prompt"]
     assert record["timestamp"] == 2_000
     assert record["input_length"] == 5
     assert record["output_length"] == 2
     assert record["hash_ids"] == [101, 202, 303]
-    assert "captured_at_unix_ms" not in record
     assert "messages" not in record
     assert "tools" not in record
 
@@ -209,6 +188,10 @@ def test_request_id_falls_back_to_response_id(tmp_path: Path) -> None:
         "model": "demo-model",
         "messages": [{"role": "user", "content": "hello"}],
     }
+    runtime = FakeRuntime(
+        hash_ids=[1],
+        encoded_lengths={"rendered prompt": 4},
+    )
 
     async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
         await receive()
@@ -235,6 +218,7 @@ def test_request_id_falls_back_to_response_id(tmp_path: Path) -> None:
     middleware = VLLMMooncakeTraceMiddleware(
         app,
         config=TraceConfig(enabled=True, path=path),
+        runtime=runtime,
         clock=lambda: 2_000,
     )
 
@@ -258,15 +242,9 @@ def test_streaming_usage_chunk_is_captured_without_changing_sse(tmp_path: Path) 
         "messages": [{"role": "user", "content": "hello"}],
         "stream": True,
     }
-    fake_writer = FakeMooncakeWriter(
+    runtime = FakeRuntime(
         hash_ids=[404, 505],
         encoded_lengths={"rendered prompt": 4},
-    )
-    writer_cache = FakeWriterCache(
-        FakeWriterBundle(
-            writer=fake_writer,
-            chat_tokenizer=FakeChatTokenizer(rendered_prompt="rendered prompt"),
-        )
     )
 
     async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
@@ -298,7 +276,7 @@ def test_streaming_usage_chunk_is_captured_without_changing_sse(tmp_path: Path) 
     middleware = VLLMMooncakeTraceMiddleware(
         app,
         config=TraceConfig(enabled=True, path=path),
-        writer_cache=writer_cache,
+        runtime=runtime,
         clock=lambda: 3_000,
     )
 
@@ -339,15 +317,9 @@ def test_streaming_without_usage_omits_output_length(tmp_path: Path) -> None:
         "messages": [{"role": "user", "content": "hello"}],
         "stream": True,
     }
-    fake_writer = FakeMooncakeWriter(
+    runtime = FakeRuntime(
         hash_ids=[11, 22],
         encoded_lengths={"rendered prompt": 6},
-    )
-    writer_cache = FakeWriterCache(
-        FakeWriterBundle(
-            writer=fake_writer,
-            chat_tokenizer=FakeChatTokenizer(rendered_prompt="rendered prompt"),
-        )
     )
 
     async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
@@ -377,7 +349,7 @@ def test_streaming_without_usage_omits_output_length(tmp_path: Path) -> None:
     middleware = VLLMMooncakeTraceMiddleware(
         app,
         config=TraceConfig(enabled=True, path=path),
-        writer_cache=writer_cache,
+        runtime=runtime,
         clock=lambda: 4_000,
     )
 
@@ -407,15 +379,9 @@ def test_prompt_usage_missing_falls_back_to_rendered_prompt_tokenization(
         "model": "demo-model",
         "messages": [{"role": "user", "content": "hello"}],
     }
-    fake_writer = FakeMooncakeWriter(
+    runtime = FakeRuntime(
         hash_ids=[7, 8, 9],
         encoded_lengths={"rendered prompt": 5},
-    )
-    writer_cache = FakeWriterCache(
-        FakeWriterBundle(
-            writer=fake_writer,
-            chat_tokenizer=FakeChatTokenizer(rendered_prompt="rendered prompt"),
-        )
     )
 
     async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
@@ -443,7 +409,7 @@ def test_prompt_usage_missing_falls_back_to_rendered_prompt_tokenization(
     middleware = VLLMMooncakeTraceMiddleware(
         app,
         config=TraceConfig(enabled=True, path=path),
-        writer_cache=writer_cache,
+        runtime=runtime,
         clock=lambda: 5_000,
     )
 
@@ -559,25 +525,19 @@ def test_oversized_request_is_skipped_but_replayed(tmp_path: Path) -> None:
     assert not path.exists()
 
 
-def test_chat_template_fallback_sets_hash_approximation(tmp_path: Path) -> None:
-    path = tmp_path / "json-fallback.jsonl"
+def test_missing_chat_template_writes_hash_error(tmp_path: Path) -> None:
+    path = tmp_path / "no-template.jsonl"
     request_payload = {
         "model": "demo-model",
         "messages": [{"role": "user", "content": "hello"}],
         "tools": [{"type": "function", "function": {"name": "lookup"}}],
     }
-    fake_writer = FakeMooncakeWriter(hash_ids=[90, 91])
-    writer_cache = FakeWriterCache(
-        FakeWriterBundle(
-            writer=fake_writer,
-            chat_tokenizer=NoChatTemplateTokenizer(),
-        )
-    )
+    runtime = FakeRuntime(render_error=RuntimeError("chat template unavailable"))
 
     async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
         await receive()
         response = {
-            "id": "chatcmpl-json-fallback",
+            "id": "chatcmpl-no-template",
             "usage": {"prompt_tokens": 4, "completion_tokens": 2},
             "choices": [{"message": {"role": "assistant", "content": "ok"}}],
         }
@@ -599,7 +559,7 @@ def test_chat_template_fallback_sets_hash_approximation(tmp_path: Path) -> None:
     middleware = VLLMMooncakeTraceMiddleware(
         app,
         config=TraceConfig(enabled=True, path=path),
-        writer_cache=writer_cache,
+        runtime=runtime,
         clock=lambda: 8_000,
     )
 
@@ -613,8 +573,11 @@ def test_chat_template_fallback_sets_hash_approximation(tmp_path: Path) -> None:
 
     [record] = _read_jsonl(path)
     assert record["timestamp"] == 8_000
-    assert record["hash_ids"] == [90, 91]
-    assert "JSON fallback" in record["hash_approximation"]
+    assert record["hash_ids"] == []
+    assert record["hash_error"] == "RuntimeError: chat template unavailable"
+    assert record["input_length"] == 4
+    assert record["output_length"] == 2
+    assert "hash_approximation" not in record
 
 
 def test_hash_failures_write_hash_error(tmp_path: Path) -> None:
@@ -623,13 +586,7 @@ def test_hash_failures_write_hash_error(tmp_path: Path) -> None:
         "model": "demo-model",
         "messages": [{"role": "user", "content": "hello"}],
     }
-    fake_writer = FakeMooncakeWriter(error=RuntimeError("boom"))
-    writer_cache = FakeWriterCache(
-        FakeWriterBundle(
-            writer=fake_writer,
-            chat_tokenizer=FakeChatTokenizer(rendered_prompt="rendered prompt"),
-        )
-    )
+    runtime = FakeRuntime(hash_error=RuntimeError("boom"))
 
     async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
         await receive()
@@ -656,7 +613,7 @@ def test_hash_failures_write_hash_error(tmp_path: Path) -> None:
     middleware = VLLMMooncakeTraceMiddleware(
         app,
         config=TraceConfig(enabled=True, path=path),
-        writer_cache=writer_cache,
+        runtime=runtime,
         clock=lambda: 9_000,
     )
 
@@ -679,6 +636,8 @@ def test_hash_failures_write_hash_error(tmp_path: Path) -> None:
 
 def test_completion_order_can_differ_from_arrival_order(tmp_path: Path) -> None:
     path = tmp_path / "completion-order.jsonl"
+    slow_runtime = FakeRuntime(hash_ids=[1], encoded_lengths={"rendered prompt": 4})
+    fast_runtime = FakeRuntime(hash_ids=[2], encoded_lengths={"rendered prompt": 4})
 
     async def slow_app(
         scope: dict[str, Any],
@@ -741,11 +700,13 @@ def test_completion_order_can_differ_from_arrival_order(tmp_path: Path) -> None:
         slow = VLLMMooncakeTraceMiddleware(
             lambda scope, receive, send: slow_app(scope, receive, send, release_first),
             config=TraceConfig(enabled=True, path=path),
+            runtime=slow_runtime,
             clock=lambda: 1_000,
         )
         fast = VLLMMooncakeTraceMiddleware(
             lambda scope, receive, send: fast_app(scope, receive, send, release_first),
             config=TraceConfig(enabled=True, path=path),
+            runtime=fast_runtime,
             clock=lambda: 2_000,
         )
         await asyncio.gather(
@@ -770,3 +731,115 @@ def test_completion_order_can_differ_from_arrival_order(tmp_path: Path) -> None:
     records = _read_jsonl(path)
     assert [record["request_id"] for record in records] == ["req-fast", "req-slow"]
     assert [record["timestamp"] for record in records] == [2_000, 1_000]
+
+
+def test_second_model_writes_hash_error_after_runtime_is_initialized(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    path = tmp_path / "multiple-models.jsonl"
+    created: list[str] = []
+
+    class FakeConstructedRuntime(FakeRuntime):
+        def __init__(self, tokenizer_name: str, *, block_size: int) -> None:
+            super().__init__(hash_ids=[31, 32], encoded_lengths={"rendered prompt": 4})
+            created.append(tokenizer_name)
+
+    monkeypatch.setattr(middleware_module, "ModelTraceRuntime", FakeConstructedRuntime)
+
+    async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        await receive()
+        response = {
+            "id": "chatcmpl-runtime-check",
+            "usage": {"prompt_tokens": 4, "completion_tokens": 2},
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+        }
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        await send(
+            {
+                "type": "http.response.body",
+                "body": json.dumps(response).encode("utf-8"),
+                "more_body": False,
+            }
+        )
+
+    middleware = VLLMMooncakeTraceMiddleware(
+        app,
+        config=TraceConfig(enabled=True, path=path),
+        clock=lambda: 10_000,
+    )
+
+    asyncio.run(
+        _run_asgi_app(
+            middleware,
+            scope=_make_scope(),
+            request_messages=_json_request_messages(
+                {"model": "first-model", "messages": [{"role": "user", "content": "hello"}]}
+            ),
+        )
+    )
+    asyncio.run(
+        _run_asgi_app(
+            middleware,
+            scope=_make_scope(),
+            request_messages=_json_request_messages(
+                {"model": "second-model", "messages": [{"role": "user", "content": "hello"}]}
+            ),
+        )
+    )
+
+    records = _read_jsonl(path)
+    assert created == ["first-model"]
+    assert records[0]["hash_ids"] == [31, 32]
+    assert "hash_error" not in records[0]
+    assert records[1]["hash_ids"] == []
+    assert "multiple models/tokenizers are not supported" in records[1]["hash_error"]
+
+
+def test_model_trace_runtime_uses_wrapped_chat_tokenizer(
+    monkeypatch: Any,
+) -> None:
+    created: dict[str, Any] = {}
+    chat_tokenizer = FakeChatTokenizer(rendered_prompt="wrapped prompt")
+
+    class WrappedTokenizer:
+        def __init__(self, underlying: FakeChatTokenizer) -> None:
+            self._tokenizer = underlying
+            self.encoded_texts: list[str] = []
+
+        def encode(self, text: str) -> list[int]:
+            self.encoded_texts.append(text)
+            return list(range(len(text)))
+
+    class FakeMooncakeWriter:
+        def __init__(self, tokenizer_name: str, *, block_size: int) -> None:
+            created["tokenizer_name"] = tokenizer_name
+            created["block_size"] = block_size
+            created["writer"] = self
+            self.tokenizer = WrappedTokenizer(chat_tokenizer)
+            self.hash_prompts: list[str] = []
+
+        def text_to_hashes(self, text: str) -> list[int]:
+            self.hash_prompts.append(text)
+            return [77, 88]
+
+    monkeypatch.setattr(middleware_module, "MooncakeWriter", FakeMooncakeWriter)
+
+    runtime = ModelTraceRuntime("demo-model", block_size=64)
+    prompt = runtime.render_prompt(
+        [{"role": "user", "content": "hello"}],
+        [{"type": "function", "function": {"name": "lookup"}}],
+    )
+
+    assert prompt == "wrapped prompt"
+    assert runtime.hash_prompt(prompt) == [77, 88]
+    assert runtime.count_tokens(prompt) == len("wrapped prompt")
+    assert created["tokenizer_name"] == "demo-model"
+    assert created["block_size"] == 64
+    assert created["writer"].hash_prompts == ["wrapped prompt"]
